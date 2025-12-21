@@ -271,6 +271,10 @@ class BroadcastPeer:
             if room != self.room or code != self.code:
                 continue
 
+            if msg_type == "presence" and self.on_presence:
+                self.on_presence(payload.get("id", ""), name)
+                continue
+
             if msg_type == "chat":
                 display = f"{name}: {text}"
             elif msg_type == "system":
@@ -278,8 +282,6 @@ class BroadcastPeer:
             else:
                 continue
             self.on_message(display)
-            if msg_type == "presence" and self.on_presence:
-                self.on_presence(payload.get("id", ""), name)
 
         self.running = False
         self.sock = None
