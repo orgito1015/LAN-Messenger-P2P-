@@ -9,6 +9,7 @@ import threading
 import tkinter as tk
 import uuid
 import time
+from collections import deque
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Optional
@@ -94,6 +95,14 @@ class DiscoveryService:
                 }
             )
             self._notify()
+
+
+    def announce_room(self, room: RoomEntry) -> None:
+        key = self._room_key(room)
+        with self.lock:
+            self.rooms[key] = room
+        self._announce(room)
+        self._notify()
 
     def request_rooms(self) -> None:
         self._broadcast({"type": "room_request", "from": self.peer_id})
@@ -192,9 +201,10 @@ class DiscoveryService:
 class BroadcastPeer:
     """Sends/receives chat messages over UDP broadcast on a shared port."""
 
-    def __init__(self, on_message, on_presence=None) -> None:
+    def __init__(self, on_message, on_presence=None, on_typing=None) -> None:
         self.on_message = on_message
         self.on_presence = on_presence
+        self.on_typing = on_typing
         self.sock: Optional[socket.socket] = None
         self.running = False
         self.thread: Optional[threading.Thread] = None
@@ -204,6 +214,11 @@ class BroadcastPeer:
         self.port = 0
         self.room = "public"
         self.code = ""
+        self.flood_windows: dict[str, deque] = {}
+        self.flood_penalties: dict[str, float] = {}
+        self.flood_limit_count = 5
+        self.flood_limit_window = 3.0
+        self.flood_penalty_seconds = 10.0
 
     def start(self, name: str, port: int, room: str, code: str) -> None:
         if self.running:
@@ -259,7 +274,8 @@ class BroadcastPeer:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
 
-            if payload.get("id") == self.peer_id:
+            peer_id = payload.get("id")
+            if peer_id == self.peer_id:
                 continue
 
             msg_type = payload.get("type")
@@ -272,12 +288,20 @@ class BroadcastPeer:
                 continue
 
             if msg_type == "presence" and self.on_presence:
-                self.on_presence(payload.get("id", ""), name)
+                self.on_presence(peer_id or "", name)
+                continue
+
+            if msg_type == "typing" and self.on_typing:
+                self.on_typing(peer_id or "", name, bool(payload.get("active", False)))
                 continue
 
             if msg_type == "chat":
+                if self._is_flooding(peer_id or "", name):
+                    continue
                 display = f"{name}: {text}"
             elif msg_type == "system":
+                if self._is_flooding(peer_id or "", name):
+                    continue
                 display = f"* {name} {text}"
             else:
                 continue
@@ -316,6 +340,25 @@ class BroadcastPeer:
             self._send({"type": "presence"})
             time.sleep(5)
 
+    def _is_flooding(self, peer_id: str, name: str) -> bool:
+        now = time.time()
+        penalty_end = self.flood_penalties.get(peer_id, 0.0)
+        if now < penalty_end:
+            return True
+        window = self.flood_windows.setdefault(peer_id, deque())
+        while window and now - window[0] > self.flood_limit_window:
+            window.popleft()
+        window.append(now)
+        if len(window) > self.flood_limit_count:
+            self.flood_penalties[peer_id] = now + self.flood_penalty_seconds
+            if self.on_message:
+                self.on_message(f"* Flood control: muting {name} for 10s")
+            return True
+        return False
+
+    def send_typing(self, active: bool) -> None:
+        self._send({"type": "typing", "active": active})
+
 
 class MessengerApp:
     """Tkinter UI that chats with all peers listening on the same UDP port."""
@@ -331,10 +374,12 @@ class MessengerApp:
         self.root = root
         self.root.title("LAN Messenger (P2P)")
         self.messages = queue.Queue()
-        self.peer = BroadcastPeer(on_message=self.messages.put, on_presence=self._on_presence)
+        self.peer = BroadcastPeer(on_message=self.messages.put, on_presence=self._on_presence, on_typing=self._on_typing)
         self.connected = False
         self._create_win: Optional[tk.Toplevel] = None
         self.current_room_key: Optional[str] = None
+        self.current_room_creator: Optional[str] = None
+        self.last_room_announce: float = 0.0
 
         self.port_var = tk.StringVar(value=str(default_port))
         self.room_var = tk.StringVar(value=default_room)
@@ -342,12 +387,19 @@ class MessengerApp:
         self.name_var = tk.StringVar(value=default_name)
         self.msg_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Disconnected")
+        self.typing_var = tk.StringVar(value="")
 
         self.discovery = DiscoveryService(self.peer.peer_id, self._on_rooms_updated)
         self.discovery.start()
 
         self.rooms: list[RoomEntry] = []
         self.presence: dict[str, dict[str, dict]] = {}
+        self.typing_states: dict[str, float] = {}
+        self.last_typing_sent: float = 0.0
+        self.last_typing_activity: float = 0.0
+        self.is_typing: bool = False
+        self.outgoing_times: deque[float] = deque()
+        self.send_penalty_until: float = 0.0
         self._build_ui()
         self._on_rooms_updated()
         self.discovery.request_rooms()
@@ -438,12 +490,18 @@ class MessengerApp:
         self.text_area.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
+        typing_frame = ttk.Frame(right_frame)
+        typing_frame.pack(fill="x", **padding)
+        self.typing_label = ttk.Label(typing_frame, textvariable=self.typing_var, foreground="#a0a0a0")
+        self.typing_label.pack(side="left", anchor="w")
+
         bottom_frame = ttk.Frame(right_frame)
         bottom_frame.pack(fill="x", **padding)
 
         self.message_entry = ttk.Entry(bottom_frame, textvariable=self.msg_var)
         self.message_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.message_entry.bind("<Return>", self._send_event)
+        self.message_entry.bind("<KeyRelease>", self._typing_event)
 
         self.send_button = ttk.Button(bottom_frame, text="Send", command=self._send_message)
         self.send_button.pack(side="right")
@@ -579,6 +637,32 @@ class MessengerApp:
         self.discovery.remove_room(room)
         self._on_rooms_updated()
 
+
+    def _broadcast_room_advertisement(self) -> None:
+        if not self.connected:
+            return
+        try:
+            port = int(self.port_var.get().strip())
+        except ValueError:
+            return
+        room = self.room_var.get().strip() or "public"
+        code = self.code_var.get().strip()
+        existing = next((r for r in self.rooms if r.name == room and r.port == port), None)
+        creator = self.current_room_creator or (existing.creator if existing else self.peer.peer_id)
+        private = existing.private if existing else bool(code)
+        room_entry = RoomEntry(name=room, port=port, private=private, creator=creator)
+        self.discovery.announce_room(room_entry)
+
+    def _on_typing(self, peer_id: str, name: str, active: bool) -> None:
+        if not self.connected or not self.current_room_key:
+            return
+        key = self.current_room_key
+        if active:
+            self.typing_states[peer_id] = time.time()
+        else:
+            self.typing_states.pop(peer_id, None)
+        self._refresh_typing_display()
+
     def _on_presence(self, peer_id: str, name: str) -> None:
         if not self.connected or not self.current_room_key:
             return
@@ -605,6 +689,47 @@ class MessengerApp:
         for _, data in items:
             self.participants_list.insert("end", data["name"])
 
+    def _refresh_typing_display(self) -> None:
+        if not self.connected or not self.current_room_key:
+            self.typing_var.set("")
+            return
+        now = time.time()
+        # remove stale typing entries (>5s) on the fly
+        stale = [pid for pid, ts in self.typing_states.items() if now - ts > 5]
+        for pid in stale:
+            self.typing_states.pop(pid, None)
+        if not self.typing_states:
+            self.typing_var.set("")
+            return
+        names = []
+        peers = self.presence.get(self.current_room_key, {})
+        for pid in self.typing_states:
+            if pid == self.peer.peer_id:
+                names.append(self.name_var.get().strip() or "Me")
+            elif pid in peers:
+                names.append(peers[pid]["name"])
+        # Fallback to peer ids if names missing
+        names = [n for n in names if n]
+        if not names:
+            self.typing_var.set("")
+            return
+        if len(names) == 1:
+            self.typing_var.set(f"[{names[0]}] is typing...")
+        else:
+            listed = ", ".join(f"[{n}]" for n in names)
+            self.typing_var.set(f"{listed} are typing...")
+
+    def _cleanup_typing(self) -> None:
+        if not self.typing_states:
+            return
+        now = time.time()
+        stale = [pid for pid, ts in self.typing_states.items() if now - ts > 5]
+        if not stale:
+            return
+        for pid in stale:
+            self.typing_states.pop(pid, None)
+        self._refresh_typing_display()
+
     def _room_key(self, port: int, room: str, code: str) -> str:
         return f"{port}|{room}|{code}"
 
@@ -625,12 +750,25 @@ class MessengerApp:
             return
 
         self.connected = True
-        priv = "private" if code else "public"
+        existing = next((r for r in self.rooms if r.name == room and r.port == port), None)
+        priv_flag = bool(code) or (existing.private if existing else False)
+        priv = "private" if priv_flag else "public"
         self.status_var.set(f"UDP {port} | room {room} ({priv}) | {name}")
         self.current_room_key = self._room_key(port, room, code)
+        if existing:
+            creator = existing.creator
+        else:
+            creator = self.peer.peer_id
+        self.current_room_creator = creator
+        self.last_room_announce = time.time()
+        self.typing_states.clear()
+        self.typing_var.set("")
+        self.outgoing_times.clear()
+        self.send_penalty_until = 0.0
         # Seed presence with self
         peers = self.presence.setdefault(self.current_room_key, {})
         peers[self.peer.peer_id] = {"name": name, "last": time.time()}
+        self._broadcast_room_advertisement()
         self._update_ui_state()
         self._append_message("Connected. Peers on this port/room will see your messages.")
         self.message_entry.focus_set()
@@ -639,13 +777,31 @@ class MessengerApp:
     def _disconnect(self) -> None:
         if not self.connected:
             return
+        if self.is_typing:
+            self.peer.send_typing(False)
+            self.is_typing = False
         self.peer.stop(announce=True)
         self.connected = False
         self.status_var.set("Disconnected")
         self._update_ui_state()
         self._append_message("Disconnected.")
         self.current_room_key = None
+        self.current_room_creator = None
+        self.last_room_announce = 0.0
         self.participants_list.delete(0, "end")
+        self.typing_states.clear()
+        self.typing_var.set("")
+        self.outgoing_times.clear()
+        self.send_penalty_until = 0.0
+
+    def _typing_event(self, _event=None) -> None:
+        if not self.connected:
+            return
+        self.is_typing = True
+        self.last_typing_activity = time.time()
+        if time.time() - self.last_typing_sent > 1.5:
+            self.peer.send_typing(True)
+            self.last_typing_sent = time.time()
 
     def _send_event(self, event: tk.Event) -> str | None:
         self._send_message()
@@ -655,12 +811,27 @@ class MessengerApp:
         if not self.connected:
             messagebox.showwarning("Not connected", "Click Connect first.")
             return
+        now = time.time()
+        if now < self.send_penalty_until:
+            wait = int(self.send_penalty_until - now) + 1
+            self._append_message(f"Flood control: wait {wait}s before sending.")
+            return
         message = self.msg_var.get().strip()
         if not message:
             return
+        self._prune_outgoing(now)
+        if len(self.outgoing_times) >= self.peer.flood_limit_count:
+            self.send_penalty_until = now + self.peer.flood_penalty_seconds
+            self._append_message("Flood control: 10s cooldown applied.")
+            return
+        self.outgoing_times.append(now)
         self.peer.send_chat(message)
+        if self.is_typing:
+            self.peer.send_typing(False)
+            self.is_typing = False
         self._append_message(f"Me: {message}")
         self.msg_var.set("")
+        self.last_typing_activity = 0.0
 
     def _poll_messages(self) -> None:
         while True:
@@ -670,7 +841,19 @@ class MessengerApp:
                 break
             self._append_message(msg)
         self._cleanup_presence()
+        self._cleanup_typing()
+        now = time.time()
+        if self.is_typing and now - self.last_typing_activity > 3:
+            self.peer.send_typing(False)
+            self.is_typing = False
+        if self.connected and now - self.last_room_announce > 8:
+            self._broadcast_room_advertisement()
+            self.last_room_announce = now
         self.root.after(100, self._poll_messages)
+
+    def _prune_outgoing(self, now: float) -> None:
+        while self.outgoing_times and now - self.outgoing_times[0] > self.peer.flood_limit_window:
+            self.outgoing_times.popleft()
 
     def _append_message(self, message: str) -> None:
         self.text_area.configure(state="normal")
@@ -725,6 +908,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     root = tk.Tk()
+    root.geometry("1200x800")
     app = MessengerApp(root, args.port, args.name, args.room, args.code)
     root.mainloop()
 
