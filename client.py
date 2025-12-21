@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tkinter peer-to-peer LAN messenger (single file, no central server)."""
+"""Tkinter peer-to-peer LAN messenger with multi-room support and per-room buffers."""
 
 import argparse
 import json
@@ -23,6 +23,25 @@ class RoomEntry:
     creator: str
     code: str = ""
     local: bool = False
+
+
+@dataclass
+class SessionState:
+    key: tuple[int, str, str]
+    port: int
+    room: str
+    code: str
+    peer: "BroadcastPeer"
+    buffer: list[str]
+    presence: dict[str, dict]
+    typing_states: dict[str, float]
+    outgoing_times: deque
+    send_penalty_until: float
+    last_typing_sent: float
+    last_typing_activity: float
+    is_typing: bool
+    last_room_announce: float
+    connected: bool = False
 
 
 class DiscoveryService:
@@ -95,7 +114,6 @@ class DiscoveryService:
                 }
             )
             self._notify()
-
 
     def announce_room(self, room: RoomEntry) -> None:
         key = self._room_key(room)
@@ -201,7 +219,8 @@ class DiscoveryService:
 class BroadcastPeer:
     """Sends/receives chat messages over UDP broadcast on a shared port."""
 
-    def __init__(self, on_message, on_presence=None, on_typing=None) -> None:
+    def __init__(self, peer_id: str, session_key: tuple[int, str, str], on_message, on_presence=None, on_typing=None) -> None:
+        self.session_key = session_key
         self.on_message = on_message
         self.on_presence = on_presence
         self.on_typing = on_typing
@@ -209,7 +228,7 @@ class BroadcastPeer:
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.presence_thread: Optional[threading.Thread] = None
-        self.peer_id = uuid.uuid4().hex[:8]
+        self.peer_id = peer_id
         self.name = ""
         self.port = 0
         self.room = "public"
@@ -288,11 +307,11 @@ class BroadcastPeer:
                 continue
 
             if msg_type == "presence" and self.on_presence:
-                self.on_presence(peer_id or "", name)
+                self.on_presence(self.session_key, peer_id or "", name)
                 continue
 
             if msg_type == "typing" and self.on_typing:
-                self.on_typing(peer_id or "", name, bool(payload.get("active", False)))
+                self.on_typing(self.session_key, peer_id or "", name, bool(payload.get("active", False)))
                 continue
 
             if msg_type == "chat":
@@ -305,7 +324,7 @@ class BroadcastPeer:
                 display = f"* {name} {text}"
             else:
                 continue
-            self.on_message(display)
+            self.on_message(self.session_key, display)
 
         self.running = False
         self.sock = None
@@ -336,7 +355,7 @@ class BroadcastPeer:
     def _presence_loop(self) -> None:
         while self.running:
             if self.on_presence:
-                self.on_presence(self.peer_id, self.name)
+                self.on_presence(self.session_key, self.peer_id, self.name)
             self._send({"type": "presence"})
             time.sleep(5)
 
@@ -352,7 +371,7 @@ class BroadcastPeer:
         if len(window) > self.flood_limit_count:
             self.flood_penalties[peer_id] = now + self.flood_penalty_seconds
             if self.on_message:
-                self.on_message(f"* Flood control: muting {name} for 10s")
+                self.on_message(self.session_key, f"* Flood control: muting {name} for 10s")
             return True
         return False
 
@@ -361,7 +380,7 @@ class BroadcastPeer:
 
 
 class MessengerApp:
-    """Tkinter UI that chats with all peers listening on the same UDP port."""
+    """Tkinter UI that chats with multiple rooms; each room has its own session and buffer."""
 
     def __init__(
         self,
@@ -374,12 +393,8 @@ class MessengerApp:
         self.root = root
         self.root.title("LAN Messenger (P2P)")
         self.messages = queue.Queue()
-        self.peer = BroadcastPeer(on_message=self.messages.put, on_presence=self._on_presence, on_typing=self._on_typing)
-        self.connected = False
+        self.peer_id = uuid.uuid4().hex[:8]
         self._create_win: Optional[tk.Toplevel] = None
-        self.current_room_key: Optional[str] = None
-        self.current_room_creator: Optional[str] = None
-        self.last_room_announce: float = 0.0
 
         self.port_var = tk.StringVar(value=str(default_port))
         self.room_var = tk.StringVar(value=default_room)
@@ -389,30 +404,27 @@ class MessengerApp:
         self.status_var = tk.StringVar(value="Disconnected")
         self.typing_var = tk.StringVar(value="")
 
-        self.discovery = DiscoveryService(self.peer.peer_id, self._on_rooms_updated)
+        self.discovery = DiscoveryService(self.peer_id, self._on_rooms_updated)
         self.discovery.start()
 
         self.rooms: list[RoomEntry] = []
-        self.presence: dict[str, dict[str, dict]] = {}
-        self.typing_states: dict[str, float] = {}
-        self.last_typing_sent: float = 0.0
-        self.last_typing_activity: float = 0.0
-        self.is_typing: bool = False
-        self.outgoing_times: deque[float] = deque()
-        self.send_penalty_until: float = 0.0
+        self.sessions: dict[tuple[int, str, str], SessionState] = {}
+        self.current_session_key: Optional[tuple[int, str, str]] = None
+        self.connected_ids: set[tuple[int, str]] = set()
+
         self._build_ui()
         self._on_rooms_updated()
         self.discovery.request_rooms()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._poll_messages)
 
+    # ---------------- UI -----------------
     def _build_ui(self) -> None:
         padding = {"padx": 8, "pady": 4}
 
         container = ttk.Frame(self.root)
         container.pack(fill="both", expand=True)
 
-        # Left panel for discovered rooms (port/room/code presets)
         left_frame = ttk.Frame(container, width=280)
         left_frame.pack(side="left", fill="y")
         left_frame.pack_propagate(False)
@@ -431,8 +443,7 @@ class MessengerApp:
 
         bm_btns = ttk.Frame(left_frame)
         bm_btns.pack(fill="x", padx=8, pady=8)
-        ttk.Button(bm_btns, text="Sync", command=self._sync_rooms).pack(fill="x", pady=(0, 4))
-        ttk.Button(bm_btns, text="Add", command=self._open_create_room_window).pack(
+        ttk.Button(bm_btns, text="Create Room", command=self._open_create_room_window).pack(
             fill="x", pady=(0, 4)
         )
         ttk.Button(bm_btns, text="Delete", command=self._delete_room).pack(fill="x")
@@ -441,7 +452,6 @@ class MessengerApp:
         self.participants_list = tk.Listbox(left_frame, height=8)
         self.participants_list.pack(fill="both", expand=False, padx=8, pady=(0, 8))
 
-        # Right side: controls + chat
         right_frame = ttk.Frame(container)
         right_frame.pack(side="left", fill="both", expand=True)
 
@@ -449,12 +459,12 @@ class MessengerApp:
         top_frame.pack(fill="x", **padding)
 
         ttk.Label(top_frame, text="Port").grid(row=0, column=0, sticky="w")
-        self.port_entry = ttk.Entry(top_frame, textvariable=self.port_var, width=8)
-        self.port_entry.grid(row=1, column=0, sticky="we", padx=(0, 6))
+        self.port_label_var = tk.StringVar(value=self.port_var.get())
+        ttk.Label(top_frame, textvariable=self.port_label_var).grid(row=1, column=0, sticky="w", padx=(0, 6))
 
         ttk.Label(top_frame, text="Room").grid(row=0, column=1, sticky="w")
-        self.room_entry = ttk.Entry(top_frame, textvariable=self.room_var, width=14)
-        self.room_entry.grid(row=1, column=1, sticky="we", padx=(0, 6))
+        self.room_label_var = tk.StringVar(value=self.room_var.get())
+        ttk.Label(top_frame, textvariable=self.room_label_var).grid(row=1, column=1, sticky="w", padx=(0, 6))
 
         ttk.Label(top_frame, text="Code (optional)").grid(row=0, column=2, sticky="w")
         self.code_entry = ttk.Entry(top_frame, textvariable=self.code_var, width=12)
@@ -512,19 +522,29 @@ class MessengerApp:
 
         self._update_ui_state()
 
+    # -------- Room list & selection ---------
     def _on_rooms_updated(self) -> None:
         self.rooms = sorted(
-            self.discovery.get_rooms(), key=lambda r: (r.port, r.name.lower(), r.code)
+            self.discovery.get_rooms(), key=lambda r: (r.port, r.name.lower(), r.creator)
         )
         self._refresh_room_list()
 
     def _refresh_room_list(self) -> None:
         self.room_list.delete(0, "end")
-        for room in self.rooms:
+        active_id = self.current_session_key[:2] if self.current_session_key else None
+        connected_ids = set(self.connected_ids)
+        for idx, room in enumerate(self.rooms):
             privacy = "private" if room.private else "public"
-            suffix = " [mine]" if room.creator == self.peer.peer_id else ""
+            suffix = " [mine]" if room.creator == self.peer_id else ""
             label = f"{room.name} @ {room.port} ({privacy}){suffix}"
             self.room_list.insert("end", label)
+            rid = (room.port, room.name)
+            if active_id and rid == active_id:
+                self.room_list.itemconfig(idx, fg="#0b3d91")  # active
+            elif rid in connected_ids:
+                self.room_list.itemconfig(idx, fg="#228b22")  # connected
+            else:
+                self.room_list.itemconfig(idx, fg="black")
 
     def _on_room_select(self, _event=None) -> None:
         selection = self.room_list.curselection()
@@ -536,15 +556,307 @@ class MessengerApp:
         room = self.rooms[idx]
         self.port_var.set(str(room.port))
         self.room_var.set(room.name)
-        if room.local:
-            self.code_var.set(room.code)
-        else:
-            self.code_var.set("")
+        self.port_label_var.set(str(room.port))
+        self.room_label_var.set(room.name)
+        # Keep code as entered; we don't reveal codes
         self._refresh_participants_display()
+        self._refresh_room_list()
+        # If already connected to this room (any code), switch view to that session
+        for key in self.sessions:
+            if (key[0], key[1]) == (room.port, room.name):
+                self._set_active_session(key)
+                return
 
-    def _sync_rooms(self) -> None:
-        self.discovery.request_rooms()
+    # ------------- Session helpers ---------------
+    def _session_for_key(self, key: tuple[int, str, str]) -> Optional[SessionState]:
+        return self.sessions.get(key)
 
+    def _set_active_session(self, key: tuple[int, str, str]) -> None:
+        self.current_session_key = key
+        session = self.sessions.get(key)
+        if session:
+            self.port_var.set(str(session.port))
+            self.room_var.set(session.room)
+            self.port_label_var.set(str(session.port))
+            self.room_label_var.set(session.room)
+            self._load_buffer(session)
+            self._refresh_participants_display()
+            self._refresh_typing_display(session)
+            self.status_var.set(f"UDP {session.port} | room {session.room}")
+        self._update_ui_state()
+        self._refresh_room_list()
+
+    def _load_buffer(self, session: SessionState) -> None:
+        self.text_area.configure(state="normal")
+        self.text_area.delete("1.0", "end")
+        for line in session.buffer:
+            self.text_area.insert("end", line + "\n")
+        self.text_area.configure(state="disabled")
+        self.text_area.see("end")
+
+    def _append_to_session(self, key: tuple[int, str, str], message: str) -> None:
+        session = self.sessions.get(key)
+        if not session:
+            return
+        session.buffer.append(message)
+        if key == self.current_session_key:
+            self.text_area.configure(state="normal")
+            self.text_area.insert("end", message + "\n")
+            self.text_area.configure(state="disabled")
+            self.text_area.see("end")
+
+    # ------------- Networking callbacks -------------
+    def _handle_peer_message(self, key: tuple[int, str, str], message: str) -> None:
+        self.messages.put(("msg", key, message))
+
+    def _handle_peer_presence(self, key: tuple[int, str, str], peer_id: str, name: str) -> None:
+        self.messages.put(("presence", key, peer_id, name))
+
+    def _handle_peer_typing(self, key: tuple[int, str, str], peer_id: str, name: str, active: bool) -> None:
+        self.messages.put(("typing", key, peer_id, name, active))
+
+    # ------------- Connect / Disconnect -------------
+    def _connect(self) -> None:
+        name = self.name_var.get().strip() or "Anonymous"
+        room = self.room_var.get().strip()
+        if not room:
+            messagebox.showwarning("No room", "Select a room or create one first.")
+            return
+        code = self.code_var.get().strip()
+        try:
+            port = int(self.port_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Invalid port", "Port must be a number.")
+            return
+
+        key = (port, room, code)
+        session = self.sessions.get(key)
+        if session and session.connected:
+            self._set_active_session(key)
+            return
+
+        peer = BroadcastPeer(
+            peer_id=self.peer_id,
+            session_key=key,
+            on_message=self._handle_peer_message,
+            on_presence=self._handle_peer_presence,
+            on_typing=self._handle_peer_typing,
+        )
+        try:
+            peer.start(name, port, room, code)
+        except OSError as exc:
+            messagebox.showerror("Could not start", f"Failed to bind port: {exc}")
+            return
+
+        session = SessionState(
+            key=key,
+            port=port,
+            room=room,
+            code=code,
+            peer=peer,
+            buffer=[],
+            presence={},
+            typing_states={},
+            outgoing_times=deque(),
+            send_penalty_until=0.0,
+            last_typing_sent=0.0,
+            last_typing_activity=0.0,
+            is_typing=False,
+            last_room_announce=time.time(),
+            connected=True,
+        )
+        # seed presence with self
+        session.presence[self.peer_id] = {"name": name, "last": time.time()}
+        self.sessions[key] = session
+        self.connected_ids.add((port, room))
+        self._set_active_session(key)
+        self._broadcast_room_advertisement(session)
+        self._append_to_session(key, "Connected. Peers on this port/room will see your messages.")
+        self.message_entry.focus_set()
+
+    def _disconnect(self) -> None:
+        if not self.current_session_key:
+            messagebox.showwarning("Not connected", "Select a connected room first.")
+            return
+        key = self.current_session_key
+        session = self.sessions.pop(key, None)
+        if session:
+            session.peer.send_typing(False)
+            session.peer.stop(announce=True)
+        self.connected_ids.discard((key[0], key[1]))
+        self.current_session_key = None
+        self.status_var.set("Disconnected")
+        self._update_ui_state()
+        self.participants_list.delete(0, "end")
+        self.typing_var.set("")
+        self.text_area.configure(state="normal")
+        self.text_area.delete("1.0", "end")
+        self.text_area.configure(state="disabled")
+        self._refresh_room_list()
+
+    # ------------- Message sending -------------
+    def _send_event(self, event: tk.Event) -> str | None:
+        self._send_message()
+        return "break"
+
+    def _send_message(self) -> None:
+        if not self.current_session_key:
+            messagebox.showwarning("Not connected", "Connect to a room first.")
+            return
+        session = self.sessions.get(self.current_session_key)
+        if not session or not session.connected:
+            messagebox.showwarning("Not connected", "Connect to a room first.")
+            return
+        now = time.time()
+        if now < session.send_penalty_until:
+            wait = int(session.send_penalty_until - now) + 1
+            self._append_to_session(session.key, f"Flood control: wait {wait}s before sending.")
+            return
+        message = self.msg_var.get().strip()
+        if not message:
+            return
+        self._prune_outgoing(session, now)
+        if len(session.outgoing_times) >= session.peer.flood_limit_count:
+            session.send_penalty_until = now + session.peer.flood_penalty_seconds
+            self._append_to_session(session.key, "Flood control: 10s cooldown applied.")
+            return
+        session.outgoing_times.append(now)
+        session.peer.send_chat(message)
+        session.is_typing = False
+        session.peer.send_typing(False)
+        self._append_to_session(session.key, f"Me: {message}")
+        self.msg_var.set("")
+        session.last_typing_activity = 0.0
+
+    def _prune_outgoing(self, session: SessionState, now: float) -> None:
+        while session.outgoing_times and now - session.outgoing_times[0] > session.peer.flood_limit_window:
+            session.outgoing_times.popleft()
+
+    # ------------- Typing UI -------------
+    def _typing_event(self, _event=None) -> None:
+        if not self.current_session_key:
+            return
+        session = self.sessions.get(self.current_session_key)
+        if not session:
+            return
+        session.is_typing = True
+        session.last_typing_activity = time.time()
+        if time.time() - session.last_typing_sent > 1.5:
+            session.peer.send_typing(True)
+            session.last_typing_sent = time.time()
+
+    def _refresh_typing_display(self, session: Optional[SessionState] = None) -> None:
+        session = session or (self.sessions.get(self.current_session_key) if self.current_session_key else None)
+        if not session:
+            self.typing_var.set("")
+            return
+        now = time.time()
+        stale = [pid for pid, ts in session.typing_states.items() if now - ts > 5]
+        for pid in stale:
+            session.typing_states.pop(pid, None)
+        if not session.typing_states:
+            self.typing_var.set("")
+            return
+        peers = session.presence
+        names = []
+        for pid in session.typing_states:
+            if pid == self.peer_id:
+                names.append(self.name_var.get().strip() or "Me")
+            elif pid in peers:
+                names.append(peers[pid]["name"])
+        names = [n for n in names if n]
+        if not names:
+            self.typing_var.set("")
+            return
+        if len(names) == 1:
+            self.typing_var.set(f"[{names[0]}] is typing...")
+        else:
+            listed = ", ".join(f"[{n}]" for n in names)
+            self.typing_var.set(f"{listed} are typing...")
+
+    # ------------- Presence & typing callbacks -------------
+    def _on_presence(self, key: tuple[int, str, str], peer_id: str, name: str) -> None:
+        session = self.sessions.get(key)
+        if not session:
+            return
+        session.presence[peer_id] = {"name": name, "last": time.time()}
+        if key == self.current_session_key:
+            self._refresh_participants_display()
+
+    def _on_typing(self, key: tuple[int, str, str], peer_id: str, name: str, active: bool) -> None:
+        session = self.sessions.get(key)
+        if not session:
+            return
+        if active:
+            session.typing_states[peer_id] = time.time()
+        else:
+            session.typing_states.pop(peer_id, None)
+        if key == self.current_session_key:
+            self._refresh_typing_display(session)
+
+    def _refresh_participants_display(self) -> None:
+        self.participants_list.delete(0, "end")
+        if not self.current_session_key:
+            return
+        session = self.sessions.get(self.current_session_key)
+        if not session:
+            return
+        now = time.time()
+        stale = [pid for pid, data in session.presence.items() if now - data.get("last", 0) > 20]
+        for pid in stale:
+            session.presence.pop(pid, None)
+        peers = session.presence
+        items = sorted(peers.items(), key=lambda item: (item[1]["name"].lower(), item[0]))
+        for _, data in items:
+            self.participants_list.insert("end", data["name"])
+
+    # ------------- Poll loop -------------
+    def _poll_messages(self) -> None:
+        while True:
+            try:
+                evt = self.messages.get_nowait()
+            except queue.Empty:
+                break
+            kind = evt[0]
+            if kind == "msg":
+                _, key, msg = evt
+                self._append_to_session(key, msg)
+            elif kind == "presence":
+                _, key, pid, name = evt
+                self._on_presence(key, pid, name)
+            elif kind == "typing":
+                _, key, pid, name, active = evt
+                self._on_typing(key, pid, name, active)
+        # house-keeping
+        self._cleanup_presence_typing()
+        now = time.time()
+        if self.current_session_key:
+            session = self.sessions.get(self.current_session_key)
+            if session:
+                if session.is_typing and now - session.last_typing_activity > 3:
+                    session.peer.send_typing(False)
+                    session.is_typing = False
+                self._refresh_typing_display(session)
+        # re-announce connected rooms periodically
+        for session in list(self.sessions.values()):
+            if not session.connected:
+                continue
+            if now - session.last_room_announce > 8:
+                self._broadcast_room_advertisement(session)
+                session.last_room_announce = now
+        self.root.after(100, self._poll_messages)
+
+    # ------------- Room advertisement -------------
+    def _broadcast_room_advertisement(self, session: SessionState) -> None:
+        room_entry = RoomEntry(
+            name=session.room,
+            port=session.port,
+            private=bool(session.code),
+            creator=self.peer_id,
+        )
+        self.discovery.announce_room(room_entry)
+
+    # ------------- Create/Delete room -------------
     def _open_create_room_window(self) -> None:
         if hasattr(self, "_create_win") and self._create_win is not None:
             self._create_win.lift()
@@ -593,7 +905,6 @@ class MessengerApp:
             messagebox.showerror("Invalid port", "Port must be a number.")
             return
 
-        # Check if port is free locally (UDP bind test).
         test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             test_sock.bind(("", port))
@@ -611,13 +922,15 @@ class MessengerApp:
             port=port,
             code=code,
             private=bool(code),
-            creator=self.peer.peer_id,
+            creator=self.peer_id,
             local=True,
         )
         self.discovery.add_local_room(room)
         self._on_rooms_updated()
         self.port_var.set(str(port))
         self.room_var.set(room_name)
+        self.port_label_var.set(str(port))
+        self.room_label_var.set(room_name)
         self.code_var.set(code)
         self._create_win = None
         win.destroy()
@@ -631,267 +944,40 @@ class MessengerApp:
         if idx >= len(self.rooms):
             return
         room = self.rooms[idx]
-        if room.creator != self.peer.peer_id:
+        if room.creator != self.peer_id:
             messagebox.showwarning("Cannot delete", "Only the creator can delete this room.")
             return
         self.discovery.remove_room(room)
         self._on_rooms_updated()
 
-
-    def _broadcast_room_advertisement(self) -> None:
-        if not self.connected:
-            return
-        try:
-            port = int(self.port_var.get().strip())
-        except ValueError:
-            return
-        room = self.room_var.get().strip() or "public"
-        code = self.code_var.get().strip()
-        existing = next((r for r in self.rooms if r.name == room and r.port == port), None)
-        creator = self.current_room_creator or (existing.creator if existing else self.peer.peer_id)
-        private = existing.private if existing else bool(code)
-        room_entry = RoomEntry(name=room, port=port, private=private, creator=creator)
-        self.discovery.announce_room(room_entry)
-
-    def _on_typing(self, peer_id: str, name: str, active: bool) -> None:
-        if not self.connected or not self.current_room_key:
-            return
-        key = self.current_room_key
-        if active:
-            self.typing_states[peer_id] = time.time()
-        else:
-            self.typing_states.pop(peer_id, None)
-        self._refresh_typing_display()
-
-    def _on_presence(self, peer_id: str, name: str) -> None:
-        if not self.connected or not self.current_room_key:
-            return
-        peers = self.presence.setdefault(self.current_room_key, {})
-        peers[peer_id] = {"name": name, "last": time.time()}
-        self._refresh_participants_display()
-
-    def _refresh_participants_display(self) -> None:
-        if self.connected and self.current_room_key:
-            key = self.current_room_key
-        else:
-            # Use currently selected fields to try matching known presence (requires correct code).
-            try:
-                port = int(self.port_var.get().strip())
-            except ValueError:
-                port = -1
-            key = self._room_key(port, self.room_var.get().strip() or "public", self.code_var.get().strip())
-        self.participants_list.delete(0, "end")
-        if not key or key not in self.presence:
-            return
-        peers = self.presence.get(key, {})
-        # Sort by name then peer_id
-        items = sorted(peers.items(), key=lambda item: (item[1]["name"].lower(), item[0]))
-        for _, data in items:
-            self.participants_list.insert("end", data["name"])
-
-    def _refresh_typing_display(self) -> None:
-        if not self.connected or not self.current_room_key:
-            self.typing_var.set("")
-            return
+    # ------------- Cleanup / UI state -------------
+    def _cleanup_presence_typing(self) -> None:
         now = time.time()
-        # remove stale typing entries (>5s) on the fly
-        stale = [pid for pid, ts in self.typing_states.items() if now - ts > 5]
-        for pid in stale:
-            self.typing_states.pop(pid, None)
-        if not self.typing_states:
-            self.typing_var.set("")
-            return
-        names = []
-        peers = self.presence.get(self.current_room_key, {})
-        for pid in self.typing_states:
-            if pid == self.peer.peer_id:
-                names.append(self.name_var.get().strip() or "Me")
-            elif pid in peers:
-                names.append(peers[pid]["name"])
-        # Fallback to peer ids if names missing
-        names = [n for n in names if n]
-        if not names:
-            self.typing_var.set("")
-            return
-        if len(names) == 1:
-            self.typing_var.set(f"[{names[0]}] is typing...")
-        else:
-            listed = ", ".join(f"[{n}]" for n in names)
-            self.typing_var.set(f"{listed} are typing...")
-
-    def _cleanup_typing(self) -> None:
-        if not self.typing_states:
-            return
-        now = time.time()
-        stale = [pid for pid, ts in self.typing_states.items() if now - ts > 5]
-        if not stale:
-            return
-        for pid in stale:
-            self.typing_states.pop(pid, None)
-        self._refresh_typing_display()
-
-    def _room_key(self, port: int, room: str, code: str) -> str:
-        return f"{port}|{room}|{code}"
-
-    def _connect(self) -> None:
-        name = self.name_var.get().strip() or "Anonymous"
-        room = self.room_var.get().strip() or "public"
-        code = self.code_var.get().strip()
-        try:
-            port = int(self.port_var.get().strip())
-        except ValueError:
-            messagebox.showerror("Invalid port", "Port must be a number.")
-            return
-
-        try:
-            self.peer.start(name, port, room, code)
-        except OSError as exc:
-            messagebox.showerror("Could not start", f"Failed to bind port: {exc}")
-            return
-
-        self.connected = True
-        existing = next((r for r in self.rooms if r.name == room and r.port == port), None)
-        priv_flag = bool(code) or (existing.private if existing else False)
-        priv = "private" if priv_flag else "public"
-        self.status_var.set(f"UDP {port} | room {room} ({priv}) | {name}")
-        self.current_room_key = self._room_key(port, room, code)
-        if existing:
-            creator = existing.creator
-        else:
-            creator = self.peer.peer_id
-        self.current_room_creator = creator
-        self.last_room_announce = time.time()
-        self.typing_states.clear()
-        self.typing_var.set("")
-        self.outgoing_times.clear()
-        self.send_penalty_until = 0.0
-        # Seed presence with self
-        peers = self.presence.setdefault(self.current_room_key, {})
-        peers[self.peer.peer_id] = {"name": name, "last": time.time()}
-        self._broadcast_room_advertisement()
-        self._update_ui_state()
-        self._append_message("Connected. Peers on this port/room will see your messages.")
-        self.message_entry.focus_set()
-        self._refresh_participants_display()
-
-    def _disconnect(self) -> None:
-        if not self.connected:
-            return
-        if self.is_typing:
-            self.peer.send_typing(False)
-            self.is_typing = False
-        self.peer.stop(announce=True)
-        self.connected = False
-        self.status_var.set("Disconnected")
-        self._update_ui_state()
-        self._append_message("Disconnected.")
-        self.current_room_key = None
-        self.current_room_creator = None
-        self.last_room_announce = 0.0
-        self.participants_list.delete(0, "end")
-        self.typing_states.clear()
-        self.typing_var.set("")
-        self.outgoing_times.clear()
-        self.send_penalty_until = 0.0
-
-    def _typing_event(self, _event=None) -> None:
-        if not self.connected:
-            return
-        self.is_typing = True
-        self.last_typing_activity = time.time()
-        if time.time() - self.last_typing_sent > 1.5:
-            self.peer.send_typing(True)
-            self.last_typing_sent = time.time()
-
-    def _send_event(self, event: tk.Event) -> str | None:
-        self._send_message()
-        return "break"
-
-    def _send_message(self) -> None:
-        if not self.connected:
-            messagebox.showwarning("Not connected", "Click Connect first.")
-            return
-        now = time.time()
-        if now < self.send_penalty_until:
-            wait = int(self.send_penalty_until - now) + 1
-            self._append_message(f"Flood control: wait {wait}s before sending.")
-            return
-        message = self.msg_var.get().strip()
-        if not message:
-            return
-        self._prune_outgoing(now)
-        if len(self.outgoing_times) >= self.peer.flood_limit_count:
-            self.send_penalty_until = now + self.peer.flood_penalty_seconds
-            self._append_message("Flood control: 10s cooldown applied.")
-            return
-        self.outgoing_times.append(now)
-        self.peer.send_chat(message)
-        if self.is_typing:
-            self.peer.send_typing(False)
-            self.is_typing = False
-        self._append_message(f"Me: {message}")
-        self.msg_var.set("")
-        self.last_typing_activity = 0.0
-
-    def _poll_messages(self) -> None:
-        while True:
-            try:
-                msg = self.messages.get_nowait()
-            except queue.Empty:
-                break
-            self._append_message(msg)
-        self._cleanup_presence()
-        self._cleanup_typing()
-        now = time.time()
-        if self.is_typing and now - self.last_typing_activity > 3:
-            self.peer.send_typing(False)
-            self.is_typing = False
-        if self.connected and now - self.last_room_announce > 8:
-            self._broadcast_room_advertisement()
-            self.last_room_announce = now
-        self.root.after(100, self._poll_messages)
-
-    def _prune_outgoing(self, now: float) -> None:
-        while self.outgoing_times and now - self.outgoing_times[0] > self.peer.flood_limit_window:
-            self.outgoing_times.popleft()
-
-    def _append_message(self, message: str) -> None:
-        self.text_area.configure(state="normal")
-        self.text_area.insert("end", message + "\n")
-        self.text_area.configure(state="disabled")
-        self.text_area.see("end")
-
-    def _cleanup_presence(self) -> None:
-        if not self.presence:
-            return
-        now = time.time()
-        changed = False
-        for room_key in list(self.presence.keys()):
-            peers = self.presence.get(room_key, {})
-            for pid in list(peers.keys()):
-                if now - peers[pid]["last"] > 20:
-                    peers.pop(pid, None)
-                    changed = True
-            if not peers:
-                self.presence.pop(room_key, None)
-                changed = True
-        if changed:
+        for session in self.sessions.values():
+            stale = [pid for pid, data in session.presence.items() if now - data.get("last", 0) > 20]
+            for pid in stale:
+                session.presence.pop(pid, None)
+            stale_typing = [pid for pid, ts in session.typing_states.items() if now - ts > 5]
+            for pid in stale_typing:
+                session.typing_states.pop(pid, None)
+        if self.current_session_key:
             self._refresh_participants_display()
+            self._refresh_typing_display()
 
     def _update_ui_state(self) -> None:
-        entries_state = "disabled" if self.connected else "normal"
-        self.port_entry.configure(state=entries_state)
-        self.room_entry.configure(state=entries_state)
-        self.code_entry.configure(state=entries_state)
-        self.name_entry.configure(state=entries_state)
-        self.connect_button.configure(state="disabled" if self.connected else "normal")
-        self.disconnect_button.configure(state="normal" if self.connected else "disabled")
-        self.send_button.configure(state="normal" if self.connected else "disabled")
-        self.message_entry.configure(state="normal" if self.connected else "disabled")
+        has_current = self.current_session_key in self.sessions if self.current_session_key else False
+        self.code_entry.configure(state="normal")
+        self.name_entry.configure(state="normal")
+        self.connect_button.configure(state="normal")
+        self.disconnect_button.configure(state="normal" if has_current else "disabled")
+        self.send_button.configure(state="normal" if has_current else "disabled")
+        self.message_entry.configure(state="normal" if has_current else "disabled")
 
     def _on_close(self) -> None:
-        self.peer.stop(announce=True)
-        self.connected = False
+        for session in self.sessions.values():
+            session.peer.send_typing(False)
+            session.peer.stop(announce=True)
+        self.sessions.clear()
         self.discovery.stop()
         self.root.destroy()
 
@@ -911,6 +997,7 @@ def main() -> None:
     root.geometry("1200x800")
     app = MessengerApp(root, args.port, args.name, args.room, args.code)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
