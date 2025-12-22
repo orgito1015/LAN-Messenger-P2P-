@@ -177,8 +177,9 @@ class DiscoveryService:
                 continue
             except OSError:
                 break
-            payload = self._decode(data)
-            if not payload:
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
 
             msg_type = payload.get("type")
@@ -246,8 +247,6 @@ class DiscoveryService:
 
 class BroadcastPeer:
     """Sends/receives chat messages over UDP broadcast on a shared port."""
-
-    XOR_KEY = b"bla-bla-bla"
 
     def __init__(self, peer_id: str, session_key: tuple[int, str, str], on_message, on_presence=None, on_typing=None) -> None:
         self.session_key = session_key
@@ -412,13 +411,13 @@ class BroadcastPeer:
             raw = json.dumps(payload).encode("utf-8")
         except (TypeError, ValueError):
             return None
-        key = self.XOR_KEY
-        return bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+        import base64
+        return base64.b64encode(raw)
 
     def _decode(self, data: bytes) -> Optional[dict]:
-        key = self.XOR_KEY
+        import base64
         try:
-            decoded = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+            decoded = base64.b64decode(data)
             return json.loads(decoded.decode("utf-8"))
         except Exception:
             return None
