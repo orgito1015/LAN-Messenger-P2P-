@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -34,6 +35,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+
+@dataclass
 
 @dataclass
 class RoomEntry:
@@ -174,8 +177,9 @@ class DiscoveryService:
                 continue
             except OSError:
                 break
-            payload = self._decode(data)
-            if not payload:
+            try:
+                payload = json.loads(data.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 continue
 
             msg_type = payload.get("type")
@@ -497,6 +501,7 @@ class MessengerWindow(QMainWindow):
         splitter.addWidget(right_widget)
 
         top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
         right_layout.addLayout(top_row)
 
         self.port_label = QLabel(self.port_value)
@@ -504,21 +509,23 @@ class MessengerWindow(QMainWindow):
 
         top_row.addWidget(QLabel("Port"))
         top_row.addWidget(self.port_label)
-        top_row.addSpacing(10)
+        top_row.addSpacing(18)
+
         top_row.addWidget(QLabel("Room"))
         top_row.addWidget(self.room_label)
-        top_row.addSpacing(10)
+        top_row.addSpacing(18)
 
         top_row.addWidget(QLabel("Code (optional)"))
         self.code_entry = QLineEdit(self.code_value)
-        self.code_entry.setMaximumWidth(120)
+        self.code_entry.setFixedWidth(140)
         top_row.addWidget(self.code_entry)
-        top_row.addSpacing(10)
+        top_row.addSpacing(18)
 
         top_row.addWidget(QLabel("Nickname"))
         self.name_entry = QLineEdit(self.name_value)
-        self.name_entry.setMaximumWidth(150)
+        self.name_entry.setFixedWidth(180)
         top_row.addWidget(self.name_entry)
+        top_row.addSpacing(18)
 
         self.connect_button = QPushButton("Connect")
         self.connect_button.clicked.connect(self._connect)
@@ -528,7 +535,8 @@ class MessengerWindow(QMainWindow):
         self.disconnect_button.clicked.connect(self._disconnect)
         top_row.addWidget(self.disconnect_button)
 
-        right_layout.addSpacing(4)
+        top_row.addStretch()
+        right_layout.addSpacing(6)
 
         self.text_area = QTextEdit()
         self.text_area.setReadOnly(True)
