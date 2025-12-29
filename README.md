@@ -29,6 +29,8 @@ If you prefer Tkinter and it is available on your system:
 ```bash
 python client-tk.py
 ```
+## Run by VSCode
+- Open one client inside **VSCode** and just run it.
 
 ## UI (both versions)
 - Left panel: discovered rooms (port/room) and a participants list. **Create Room** opens the room-creation window, **Delete** removes a room only if you created it and nobody is inside the room. Selecting a room shows known participants (requires the correct code for private rooms).
