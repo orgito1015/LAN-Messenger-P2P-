@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import socket
+import struct
 import threading
 import time
 from collections import deque
@@ -250,7 +251,9 @@ class BroadcastPeer:
         if self.running:
             return
         self.name = name or "Anonymous"
-        self.port = port
+        self.port = int(port)
+        if not (1 <= self.port <= 65535):
+            raise OSError("Invalid port (use 1-65535)")
         self.room = room or "public"
         self.code = code.strip()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -260,7 +263,14 @@ class BroadcastPeer:
         except (OSError, AttributeError):
             pass
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind(("", port))
+        try:
+            sock.bind(("", self.port))
+        except OSError:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
         sock.settimeout(1.0)
         self.sock = sock
         self.running = True
@@ -406,3 +416,206 @@ class BroadcastPeer:
             return json.loads(decoded.decode("utf-8"))
         except Exception:
             return None
+
+
+def _recv_exact(sock: socket.socket, n: int) -> Optional[bytes]:
+    """Receive exactly n bytes from a TCP socket, or None if EOF."""
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+class RelayPeer:
+    """Sends/receives messages via a TCP relay server (for cross-campus testing).
+
+    Frames are length-prefixed: 4-byte big-endian length + payload bytes (Base64 JSON).
+    """
+
+    def __init__(
+        self,
+        peer_id: str,
+        session_key: tuple[int, str, str],
+        on_message,
+        on_presence=None,
+        on_typing=None,
+        relay_host: str = "127.0.0.1",
+        relay_port: int = 9000,
+    ) -> None:
+        self.peer_id = peer_id
+        self.session_key = session_key
+        self.on_message = on_message
+        self.on_presence = on_presence
+        self.on_typing = on_typing
+        self.relay_host = relay_host
+        self.relay_port = int(relay_port)
+
+        self.name = "Anonymous"
+        self.port = 0
+        self.room = "public"
+        self.code = ""
+
+        self.sock: Optional[socket.socket] = None
+        self.running = False
+        self.thread: Optional[threading.Thread] = None
+        self.presence_thread: Optional[threading.Thread] = None
+
+    def start(self, name: str, port: int, room: str, code: str) -> None:
+        if self.running:
+            return
+        self.name = name or "Anonymous"
+        self.port = int(port)  # kept for compatibility with UI/session keys
+        self.room = room or "public"
+        self.code = code.strip()
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(6.0)
+        sock.connect((self.relay_host, self.relay_port))
+        sock.settimeout(1.0)
+
+        self.sock = sock
+        self.running = True
+        self.thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self.thread.start()
+        self.presence_thread = threading.Thread(target=self._presence_loop, daemon=True)
+        self.presence_thread.start()
+        self._send_system("joined the chat (relay)")
+
+    def stop(self, announce: bool = True) -> None:
+        if not self.running:
+            return
+        if announce:
+            self._send_system("left the chat")
+        self.running = False
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    def send_text(self, text: str) -> None:
+        self._send({"type": "chat", "text": text})
+
+    def send_typing(self, active: bool) -> None:
+        self._send({"type": "typing", "active": active})
+
+    def _encode(self, payload: dict) -> Optional[bytes]:
+        try:
+            return base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        except Exception:
+            return None
+
+    def _decode(self, data: bytes) -> Optional[dict]:
+        try:
+            decoded = base64.b64decode(data)
+            return json.loads(decoded.decode("utf-8"))
+        except Exception:
+            return None
+
+    def _send_frame(self, data: bytes) -> None:
+        if self.sock is None:
+            return
+        header = struct.pack("!I", len(data))
+        self.sock.sendall(header + data)
+
+    def _send(self, payload: dict) -> None:
+        if self.sock is None:
+            return
+        payload.update(
+            {
+                "id": self.peer_id,
+                "name": self.name,
+                "room": self.room,
+                "code": self.code,
+            }
+        )
+        data = self._encode(payload)
+        if data is None:
+            return
+        try:
+            self._send_frame(data)
+        except OSError:
+            pass
+
+    def _send_system(self, text: str) -> None:
+        self._send({"type": "system", "text": text})
+
+    def _presence_loop(self) -> None:
+        while self.running:
+            if self.on_presence:
+                try:
+                    self.on_presence(self.session_key, self.peer_id, self.name)
+                except Exception:
+                    pass
+            self._send({"type": "presence"})
+            time.sleep(5)
+
+    def _recv_loop(self) -> None:
+        assert self.sock is not None
+        while self.running:
+            try:
+                header = _recv_exact(self.sock, 4)
+                if not header:
+                    break
+                (n,) = struct.unpack("!I", header)
+                if n <= 0 or n > 1024 * 1024:
+                    break
+                data = _recv_exact(self.sock, n)
+                if not data:
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            payload = self._decode(data)
+            if not payload:
+                continue
+
+            peer_id = payload.get("id")
+            if peer_id == self.peer_id:
+                continue
+
+            msg_type = payload.get("type")
+            name = payload.get("name", "Unknown")
+            text = payload.get("text", "")
+            room = payload.get("room", "public")
+            code = payload.get("code", "")
+
+            if room != self.room or code != self.code:
+                continue
+
+            if msg_type == "presence" and self.on_presence:
+                try:
+                    self.on_presence(self.session_key, peer_id or "", name)
+                except Exception:
+                    pass
+                continue
+
+            if msg_type == "typing" and self.on_typing:
+                try:
+                    self.on_typing(self.session_key, peer_id or "", name, bool(payload.get("active", False)))
+                except Exception:
+                    pass
+                continue
+
+            if msg_type == "chat":
+                display = f"{name}: {text}"
+            elif msg_type == "system":
+                display = f"* {name} {text}"
+            else:
+                continue
+
+            if self.on_message:
+                try:
+                    self.on_message(self.session_key, display)
+                except Exception:
+                    pass
+
+        self.running = False
+        self.sock = None
+

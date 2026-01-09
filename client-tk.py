@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 from typing import Optional
-from p2p_server import BroadcastPeer, DiscoveryService, RoomEntry
+from p2p_server import BroadcastPeer, RelayPeer, DiscoveryService, RoomEntry
 
 AUTO_ROOM_PORT = 4242
 AUTO_ROOM_NAME = "42 Global"
@@ -52,6 +52,20 @@ class MessengerApp:
         self.root.title("LAN Messenger (P2P)")
         self.messages = queue.Queue()
         self.peer_id = uuid.uuid4().hex[:8]
+
+self.relay_host = ""
+self.relay_port = 9000
+if relay:
+    # relay format: host:port
+    if ":" in relay:
+        h, p = relay.rsplit(":", 1)
+        self.relay_host = h.strip()
+        try:
+            self.relay_port = int(p.strip())
+        except ValueError:
+            self.relay_port = 9000
+    else:
+        self.relay_host = relay.strip()
         self._create_win: Optional[tk.Toplevel] = None
 
         self.port_var = tk.StringVar(value=str(default_port))
@@ -294,14 +308,18 @@ class MessengerApp:
             self._set_active_session(key)
             return
 
-        peer = BroadcastPeer(
-            peer_id=self.peer_id,
-            session_key=key,
-            on_message=self._handle_peer_message,
-            on_presence=self._handle_peer_presence,
-            on_typing=self._handle_peer_typing,
-        )
-        try:
+        
+PeerCls = RelayPeer if self.relay_host else BroadcastPeer
+peer = PeerCls(
+    peer_id=self.peer_id,
+    session_key=key,
+    on_message=self._handle_peer_message,
+    on_presence=self._handle_peer_presence,
+    on_typing=self._handle_peer_typing,
+    **({"relay_host": self.relay_host, "relay_port": self.relay_port} if self.relay_host else {}),
+)
+try:
+
             peer.start(name, port, room, code)
         except OSError as exc:
             messagebox.showerror("Could not start", f"Failed to bind port: {exc}")
@@ -667,6 +685,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--room", default=AUTO_ROOM_NAME, help="Room/channel name")
     parser.add_argument("--code", default=AUTO_ROOM_CODE, help="Private code (must match to receive)")
     parser.add_argument("--name", default="", help="Display name")
+    parser.add_argument("--relay", default="", help="Use TCP relay host:port (enables cross-campus mode)")
     return parser.parse_args()
 
 
@@ -674,7 +693,7 @@ def main() -> None:
     args = parse_args()
     root = tk.Tk()
     root.geometry("1200x800")
-    app = MessengerApp(root, args.port, args.name, args.room, args.code)
+    app = MessengerApp(root, args.port, args.name, args.room, args.code, args.relay)
     root.mainloop()
 
 

@@ -48,3 +48,29 @@ python client-tk.py
 - Traffic is basically encrypted; but it can be easily seen. Use only on trusted networks.
 - All peers must share the same port and room. If a `Code` is set, only peers using the identical code will see messages (it is not cryptographically secure).
 - Ensure your firewall allows UDP on the chosen port.
+
+
+## Relay (cross-campus) mode (experimental)
+
+UDP broadcast usually **cannot** cross routers/VLANs (e.g., between campuses).  
+To test Marseille ↔ Tirana, you can use the included **TCP relay server**.
+
+### 1) Start the relay server (on a machine reachable by both sides)
+```bash
+python relay_server.py --host 0.0.0.0 --port 9000
+```
+
+### 2) Start a client using the relay
+Tkinter:
+```bash
+python client-tk.py --relay <RELAY_IP>:9000
+```
+
+PySide6:
+```bash
+python client-pyside.py --relay <RELAY_IP>:9000
+```
+
+Rooms still work the same (room + port + code), but discovery is local-only.
+
+**Security note:** this is still an educational project (no strong encryption/auth).

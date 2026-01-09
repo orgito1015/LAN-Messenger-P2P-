@@ -66,6 +66,7 @@ class MessengerWindow(QMainWindow):
         default_name: str = "",
         default_room: str = AUTO_ROOM_NAME,
         default_code: str = AUTO_ROOM_CODE,
+        relay: str = "",
     ) -> None:
         super().__init__()
         self.setWindowTitle("LAN Messenger (PySide6)")
@@ -73,6 +74,19 @@ class MessengerWindow(QMainWindow):
 
         self.messages = queue.Queue()
         self.peer_id = uuid.uuid4().hex[:8]
+
+self.relay_host = ""
+self.relay_port = 9000
+if relay:
+    if ":" in relay:
+        h, p = relay.rsplit(":", 1)
+        self.relay_host = h.strip()
+        try:
+            self.relay_port = int(p.strip())
+        except ValueError:
+            self.relay_port = 9000
+    else:
+        self.relay_host = relay.strip()
 
         self.port_value = str(default_port)
         self.room_value = default_room
@@ -309,14 +323,18 @@ class MessengerWindow(QMainWindow):
             self._set_active_session(key)
             return
 
-        peer = BroadcastPeer(
-            peer_id=self.peer_id,
-            session_key=key,
-            on_message=self._handle_peer_message,
-            on_presence=self._handle_peer_presence,
-            on_typing=self._handle_peer_typing,
-        )
-        try:
+        
+PeerCls = RelayPeer if self.relay_host else BroadcastPeer
+peer = PeerCls(
+    peer_id=self.peer_id,
+    session_key=key,
+    on_message=self._handle_peer_message,
+    on_presence=self._handle_peer_presence,
+    on_typing=self._handle_peer_typing,
+    **({"relay_host": self.relay_host, "relay_port": self.relay_port} if self.relay_host else {}),
+)
+try:
+
             peer.start(name, port, room, code)
         except OSError as exc:
             QMessageBox.critical(self, "Could not start", f"Failed to bind port: {exc}")
@@ -649,6 +667,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--room", default=AUTO_ROOM_NAME, help="Room/channel name")
     parser.add_argument("--code", default=AUTO_ROOM_CODE, help="Private code (must match to receive)")
     parser.add_argument("--name", default="", help="Display name")
+    parser.add_argument("--relay", default="", help="Use TCP relay host:port (enables cross-campus mode)")
     return parser.parse_args()
 
 
